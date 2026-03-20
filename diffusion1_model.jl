@@ -6,14 +6,14 @@ using Flux: Dense, Chain, relu
 
 
 const lr = 3e-4
-const epochs = 100
 const T_diff = 100    # Horizon length
 const nu = mj_model.nu      # ← relies on mj_model from mppi.jl
-const H = 30
+const H = 40
 state_dim = mj_model.nq + mj_model.nv
 traj_dim  = nu * H
 in_dim    = traj_dim + state_dim + 1
-hidden_dim = 256
+hidden_dim = 512
+hidd_dim = 256
 
 # trajectories: K x nu x H
 # Convert to a Flux-friendly format: (samples, features)
@@ -38,7 +38,8 @@ end
 model = Chain(
     Dense(in_dim, hidden_dim, relu),
     Dense(hidden_dim, hidden_dim, relu),
-    Dense(hidden_dim, traj_dim)
+    Dense(hidden_dim, hidd_dim, relu),
+    Dense(hidd_dim, traj_dim)
 )
 
 
@@ -49,7 +50,7 @@ function q_sample(x0, t, α)
     return xt, ϵ
 end
 
-function train_diffusion!(model, X_state, X_ctrl; epochs=100, lr=3e-4)
+function train_diffusion!(model, X_state, X_ctrl; epochs, lr=1e-4)
     opt = Flux.setup(Adam(lr), model)
     T = 100
     β_sched = collect(LinRange(1e-4, 0.02, T))
