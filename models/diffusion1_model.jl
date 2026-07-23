@@ -42,8 +42,6 @@ model = Chain(
     Dense(hidd_dim, traj_dim)
 )
 
-
-
 function q_sample(x0, t, α)
     ϵ = randn(Float32, size(x0))
     xt = sqrt(α[t]) .* x0 .+ sqrt(1 - α[t]) .* ϵ

@@ -8,17 +8,34 @@ mj_model = load_model("go2/scene.xml")
 mj_data  = init_data(mj_model)
 include("diffusion1_model.jl")
 
-const K  = 30
+const K  = 150
 const λ  = 0.1
 const KP = 50.0    # PD proportional gain
 const KD = 3.0     # PD derivative gain
 
+# Go2 stable standing pose: [hip, thigh, knee] × 4 legs
+const HOME_POS = Float64[
+    0.0, 0.9, -1.8,
+    0.0, 0.9, -1.8,
+    0.0, 0.9, -1.8,
+    0.0, 0.9, -1.8
+]
+
 const noise_sigma = Float64[
-    0.15, 0.25, 0.25,   # increased — was 0.06, 0.1, 0.1
+    0.15, 0.25, 0.25,
     0.15, 0.25, 0.25,
     0.15, 0.25, 0.25,
     0.15, 0.25, 0.25
 ]
+
+# Per-joint torque limits from MJCF: hip/thigh = 23.7, knee = 45.43
+const TORQUE_LIMIT = Float64[
+    23.7, 23.7, 45.43,
+    23.7, 23.7, 45.43,
+    23.7, 23.7, 45.43,
+    23.7, 23.7, 45.43
+]
+
 # U_global now holds JOINT POSITION TARGETS not torques
 const U_global = zeros(nu, H)
 dataset = []
@@ -39,24 +56,24 @@ function cost(qpos, qvel, pos_target)
     # Orientation via quaternion distance
     q = [qpos[4], qpos[5], qpos[6], qpos[7]]
     quat_dist = 1.0 - clamp(abs(sum(q .* target_quat)), 0.0, 1.0)
-    quat_cost = 400000.0 * quat_dist^2
+    quat_cost = 20000.0 * quat_dist^2
 
     # Joint tracking — zeros is the natural standing pose
-    joint_cost = 800.0 * sum((qpos[8:19] .- zeros(12)).^2)
+    joint_cost = 800.0 * sum((qpos[8:19] .- HOME_POS).^2)
 
     # Forward velocity — penalize backward motion harder
     vel_x = qvel[1]
     vel_cost = vel_x >= 0 ?
         500.0 * (vel_x - target_vel_x)^2 :
         8000.0 * vel_x^2
-    forward_bonus = -500.0 * max(0.0, qvel[1])
+    
     # Lateral drift
     lateral_cost = 500.0 * qvel[2]^2
 
     # Joint velocity smoothness
     jvel_cost = 0.1 * sum(qvel[7:18].^2)
 
-    return height_cost + quat_cost + joint_cost + vel_cost + lateral_cost + jvel_cost + forward_bonus
+    return height_cost + quat_cost + joint_cost + vel_cost + lateral_cost + jvel_cost 
 end
 
 # ── Rollout ───────────────────────────────────────────────────────────
@@ -79,7 +96,7 @@ function rollout(m::Model, d::Data, U::Matrix{Float64}, noise::Array{Float64,3})
             joint_vel = d_copy.qvel[7:18]
             torques = KP .* (pos_target .- joint_pos) .- KD .* joint_vel
 
-            d_copy.ctrl .= clamp.(torques, -33.5, 33.5)
+            d_copy.ctrl .= clamp.(torques, -TORQUE_LIMIT, TORQUE_LIMIT)
             mj_step(m, d_copy)
 
             cost_sum += cost(d_copy.qpos, d_copy.qvel, pos_target)
@@ -103,7 +120,9 @@ function mppi_update!(m::Model, d::Data)
     costs, trajectories = rollout(m, d, U_global, noise)
 
     β = minimum(costs)
-    weights = exp.(-1 / λ * (costs .- β))
+    cost_std = std(costs) + 1e-6
+    λ_eff = 0.5 * cost_std        # adaptive temperature — tune the 0.5 factor
+    weights = exp.(-1 / λ_eff * (costs .- β))
     weights ./= sum(weights) + 1e-10
 
     for t in 1:H
@@ -115,10 +134,10 @@ function mppi_update!(m::Model, d::Data)
     joint_pos = d.qpos[8:19]
     joint_vel = d.qvel[7:18]
     torques = KP .* (U_global[:, 1] .- joint_pos) .- KD .* joint_vel
-    d.ctrl .= clamp.(torques, -33.5, 33.5)
+    d.ctrl .= clamp.(torques, -TORQUE_LIMIT, TORQUE_LIMIT)
 
     U_global[:, 1:end-1] .= U_global[:, 2:end]
-    U_global[:, end] .= 0.0
+    U_global[:, end] .= HOME_POS
 
     return costs, trajectories
 end
@@ -138,19 +157,19 @@ end
 # ── Reset ─────────────────────────────────────────────────────────────
 function reset_robot!(m, d)
     MuJoCo.mj_resetData(m, d)
-    d.qpos[3]    = 0.445
+    d.qpos[3]    = 0.27
     d.qpos[4]    = 1.0
     d.qpos[5]    = 0.0
     d.qpos[6]    = 0.0
     d.qpos[7]    = 0.0
-    d.qpos[8:19] .= 0.0
+    d.qpos[8:19] .= HOME_POS
     d.qvel       .= 0.0
     MuJoCo.mj_forward(m, d)
 end
 
 # ── Phase 1: Data Collection ──────────────────────────────────────────
 reset_robot!(mj_model, mj_data)
-U_global .= 0.0
+for t in 1:H; U_global[:, t] .= HOME_POS; end
 global fall_count = 0
 
 for iter in 1:300
@@ -182,6 +201,6 @@ train_diffusion!(model, X_state, X_ctrl; epochs=100)
 
 # ── Phase 4: Visualise ────────────────────────────────────────────────
 reset_robot!(mj_model, mj_data)
-U_global .= 0.0
+for t in 1:H; U_global[:, t] .= HOME_POS; end
 init_visualiser()
 visualise!(mj_model, mj_data; controller=mppi_update!)
