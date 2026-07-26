@@ -8,7 +8,9 @@ const lr = 1e-3
 const T_diff = 50     # Diffusion horizon length
 const nu = mj_model.nu # relies on mj_model
 const H = 40
-state_dim = mj_model.nq + mj_model.nv
+const diff_history_len = 4
+single_state_dim = mj_model.nq + mj_model.nv
+state_dim = single_state_dim * diff_history_len
 traj_dim  = nu * H
 const t_dim = 16       # 16-dimensional Sinusoidal time embedding
 in_dim    = traj_dim + state_dim + t_dim
@@ -18,9 +20,8 @@ function prepare_dataset(dataset, μ_q, σ_q, μ_u, σ_u)
     X_state = Vector{Float32}[]
     X_ctrl  = Vector{Float32}[]
 
-    for (qpos, qvel, traj) in dataset
-        q = vcat(qpos, qvel)
-        qn = vec((q .- μ_q) ./ σ_q)
+    for (hist_vec, traj) in dataset
+        qn = vec((hist_vec .- μ_q) ./ σ_q)
         un = vec((traj .- μ_u) ./ σ_u)
 
         push!(X_state, Float32.(qn))

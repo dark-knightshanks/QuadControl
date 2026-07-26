@@ -114,7 +114,7 @@ function cost(qpos, qvel, pos_target)
     vel_cost = if vel_x <= target_vel_x
         50000.0 * (vel_x - target_vel_x)^2        # Strong forward pull towards 0.3 m/s
     else
-        30000.0 * (vel_x - target_vel_x)^2        # Penalize overshooting 0.3 m/s
+        100000.0 * (vel_x - target_vel_x)^2       # Heavy penalty for overspeeding >0.3 m/s to prevent forward pitch collapse
     end
 
     # Lateral drift penalty
@@ -209,11 +209,64 @@ function mppi_update!(m::Model, d::Data)
     return costs, trajectories
 end
 
+# ── Non-Invasive MPPI Expert Querying ──────────────────────────────────
+function query_mppi_expert(m::Model, state_qpos::Vector{Float64}, state_qvel::Vector{Float64}, warm_U::Matrix{Float64})
+    d_query = init_data(m)
+    d_query.qpos .= state_qpos
+    d_query.qvel .= state_qvel
+
+    # Warm start directly from current trajectory warm_U (no static HOME_POS decay)
+    U_expert = copy(warm_U)
+
+    # Run 15 refinement iterations on isolated d_query copy so MPPI fully converges
+    for _ in 1:15
+        noise = zeros(nu, H, K)
+        for k in 1:K, t in 1:H
+            noise[:, t, k] .= randn(nu) .* noise_sigma
+        end
+        costs, trajectories = rollout(m, d_query, U_expert, noise)
+        β = minimum(costs)
+        cost_std = std(costs) + 1e-6
+        λ_eff = 0.15 * cost_std
+        weights = exp.(-1 / λ_eff * (costs .- β))
+        weights ./= sum(weights) + 1e-10
+
+        for t in 1:H
+            weighted_noise = sum(weights[k] * noise[:, t, k] for k in 1:K)
+            U_expert[:, t] .= clamp.(U_expert[:, t] + weighted_noise, JOINT_LOWER, JOINT_UPPER)
+        end
+    end
+
+    return U_expert
+end
+
+# ── State History Queue Buffer (History-Conditioned Diffusion) ───────────
+const state_history = Vector{Float32}[]
+
+function get_history_vector(current_state::AbstractVector{Float32})
+    curr_vec = vec(current_state)
+    push!(state_history, curr_vec)
+    while length(state_history) > diff_history_len
+        popfirst!(state_history)
+    end
+    while length(state_history) < diff_history_len
+        pushfirst!(state_history, state_history[1])
+    end
+    return vcat(state_history...)
+end
+
+function clear_history_buffer!(initial_state::AbstractVector{Float32})
+    empty!(state_history)
+    init_vec = vec(initial_state)
+    for _ in 1:diff_history_len
+        push!(state_history, init_vec)
+    end
+end
+
 # ── Dataset (Saves true converged U_global trajectory) ─────────────────
-function collect_dataset!(dataset, mj_data, U_opt::Matrix{Float64})
+function collect_dataset!(dataset, history_vec::Vector{Float32}, U_opt::Matrix{Float64})
     push!(dataset, (
-        Float32.(mj_data.qpos),
-        Float32.(mj_data.qvel),
+        history_vec,
         vec(Float32.(U_opt))  # True MPPI weighted optimal trajectory (nu x H)
     ))
 end
@@ -238,6 +291,7 @@ function reset_robot!(m, d)
         d.ctrl .= clamp.(ctrl_torques, -TORQUE_LIMIT, TORQUE_LIMIT)
         mj_step(m, d)
     end
+    clear_history_buffer!(vec(Float32.(vcat(d.qpos, d.qvel))))
 end
 
 # ── Phase 1: Data Collection (visualised) ─────────────────────────────
@@ -261,47 +315,87 @@ log_jvel_c     = Float64[]
 log_n_sat      = Int[]
 log_max_torque = Float64[]
 
-const MAX_ITERS = 300
-const PHASE4_ITERS = 200   # Run 200 more iterations under diffusion-warm-started MPPI
+const DATA_ITERS   = 500     # Collect 500 MPPI expert iterations for well-converged dataset
+const EXEC_STEPS   = 4       # Receding horizon: re-predict every 4 steps
 
-# Globals for Phase 4 normalization stats (set during training)
-global phase4_ready = false
+# DAgger configuration
+const DAGGER_ROUNDS        = 2     # Number of DAgger correction rounds
+const DAGGER_STEPS         = 200   # Steps per DAgger round (Diffusion policy acts, MPPI labels)
+const FINAL_DIFFUSION_ITERS = 1000  # Final pure Diffusion execution after all DAgger rounds (1000 steps)
+
+# Globals for Phase 4 normalization stats & training state
+global policy_ready = false
+global dagger_round = 0
+global dagger_step_in_round = 0
 global phase4_μ_q = nothing
 global phase4_σ_q = nothing
 global phase4_μ_u = nothing
 global phase4_σ_u = nothing
 global phase4_α   = nothing
 
+function compute_phase_boundary()
+    dagger_total = DAGGER_ROUNDS * DAGGER_STEPS
+    return DATA_ITERS + dagger_total
+end
+
+function retrain_diffusion_policy!()
+    global phase4_μ_q, phase4_σ_q, phase4_μ_u, phase4_σ_u, phase4_α
+
+    # Filter out fallen states (most recent frame height in history < 0.28m)
+    filtered_dataset = filter(d -> d[1][end-mj_model.nv-mj_model.nq+3] >= 0.28, dataset)
+    println("✓ Retraining Diffusion model on aggregated dataset: $(length(dataset)) total steps. Clean non-fallen samples: $(length(filtered_dataset))")
+
+    Q = hcat([d[1] for d in filtered_dataset]...)
+    U_ds = hcat([d[2] for d in filtered_dataset]...)
+    phase4_μ_q = Float32.(mean(Q, dims=2))
+    phase4_σ_q = Float32.(std(Q,  dims=2) .+ 1e-6)
+    phase4_μ_u = Float32.(mean(U_ds, dims=2))
+    phase4_σ_u = Float32.(std(U_ds,  dims=2) .+ 1e-6)
+    X_state, X_ctrl = prepare_dataset(filtered_dataset, phase4_μ_q, phase4_σ_q, phase4_μ_u, phase4_σ_u)
+
+    # Train Diffusion Model on aggregated MPPI Trajectories
+    train_diffusion!(model, X_state, X_ctrl; epochs=100, batchsize=64, lr=1e-3)
+
+    # Precompute noise schedule
+    β_sched = Float32.(collect(LinRange(1e-4, 0.18, T_diff)))
+    phase4_α = cumprod(1.0f0 .- β_sched)
+end
+
 function visual_controller!(m, d)
-    global vis_iter, fall_count, phase4_ready
+    global vis_iter, fall_count, policy_ready
+    global dagger_round, dagger_step_in_round
     global phase4_μ_q, phase4_σ_q, phase4_μ_u, phase4_σ_u, phase4_α
 
     vis_iter += 1
     iter = vis_iter
 
-    # ── Phase 4: Pure Diffusion Policy (Receding Horizon) ─────────────
-    #   No MPPI — diffusion model is the sole controller.
-    #   Re-predict trajectory every EXEC_STEPS from current state.
-    if iter > MAX_ITERS
-        if iter > MAX_ITERS + PHASE4_ITERS
+    dagger_end = compute_phase_boundary()
+    total_end  = dagger_end + FINAL_DIFFUSION_ITERS
+
+    # Update state history buffer with current frame
+    curr_state_vec = vec(Float32.(vcat(d.qpos, d.qvel)))
+    hist_vec = get_history_vector(curr_state_vec)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE 4: Pure Diffusion Policy (Receding Horizon + DAgger Trained)
+    # ═══════════════════════════════════════════════════════════════════
+    if iter > dagger_end
+        if iter > total_end
             return
         end
 
-        EXEC_STEPS = 4  # Execute only 4 steps before re-planning
+        final_step = iter - dagger_end
 
-        phase4_step = iter - MAX_ITERS  # 1-indexed phase4 counter
-
-        # Re-predict trajectory from current state every EXEC_STEPS
-        if phase4_ready && mod(phase4_step - 1, EXEC_STEPS) == 0
-            current_state = Float32.(vcat(d.qpos, d.qvel))
-            norm_state = (current_state .- phase4_μ_q) ./ phase4_σ_q
+        # Re-predict trajectory from current state history every EXEC_STEPS
+        if policy_ready && mod(final_step - 1, EXEC_STEPS) == 0
+            norm_state = (hist_vec .- phase4_μ_q) ./ phase4_σ_q
             u_ws = ddim_sample(model, norm_state, phase4_α, T_diff; num_steps=20)
             μ_u_mat = reshape(phase4_μ_u, nu, H)
             σ_u_mat = reshape(phase4_σ_u, nu, H)
             global U_global .= clamp.((u_ws .* σ_u_mat) .+ μ_u_mat, JOINT_LOWER, JOINT_UPPER)
         end
 
-        # Apply PD control from U_global[:, 1] (pure diffusion, no MPPI)
+        # Apply PD control from U_global[:, 1]
         joint_pos = d.qpos[8:19]
         joint_vel = d.qvel[7:18]
         raw_torques = KP .* (U_global[:, 1] .- joint_pos) .- KD .* joint_vel
@@ -317,8 +411,8 @@ function visual_controller!(m, d)
         U_global[:, 1:end-1] .= U_global[:, 2:end]
         U_global[:, end] .= HOME_POS
 
-        if mod(phase4_step, 10) == 0
-            println("Phase4 [Diffusion Only] Step $phase4_step | height = $(round(d.qpos[3], digits=3)) | vel_x = $(round(d.qvel[1], digits=3))")
+        if mod(final_step, 10) == 0
+            println("Phase4 [Diffusion Only] Step $final_step | height = $(round(d.qpos[3], digits=3)) | vel_x = $(round(d.qvel[1], digits=3))")
         end
 
         # Fall detection during Phase 4
@@ -333,15 +427,84 @@ function visual_controller!(m, d)
         return
     end
 
-    # ── Phase 1–2: Data Collection with MPPI ────────────────────────
-    # Record state BEFORE MPPI step
-    state_qpos = copy(d.qpos)
-    state_qvel = copy(d.qvel)
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE 3: DAgger Correction Rounds for Diffusion Policy
+    # ═══════════════════════════════════════════════════════════════════
+    if iter > DATA_ITERS && iter <= dagger_end
+        dagger_offset = iter - DATA_ITERS
+        current_round = div(dagger_offset - 1, DAGGER_STEPS) + 1
+        step_in_round = mod(dagger_offset - 1, DAGGER_STEPS) + 1
 
+        if step_in_round == 1 && current_round != dagger_round
+            dagger_round = current_round
+            println("\n=== DAgger Round $dagger_round / $DAGGER_ROUNDS: Diffusion policy acts, MPPI relabels ($DAGGER_STEPS steps) ===")
+            reset_robot!(m, d)
+            for t in 1:H; U_global[:, t] .= HOME_POS; end
+        end
+
+        # Diffusion policy rollouts state history action prediction
+        if policy_ready && mod(step_in_round - 1, EXEC_STEPS) == 0
+            norm_state = (hist_vec .- phase4_μ_q) ./ phase4_σ_q
+            u_ws = ddim_sample(model, norm_state, phase4_α, T_diff; num_steps=20)
+            μ_u_mat = reshape(phase4_μ_u, nu, H)
+            σ_u_mat = reshape(phase4_σ_u, nu, H)
+            global U_global .= clamp.((u_ws .* σ_u_mat) .+ μ_u_mat, JOINT_LOWER, JOINT_UPPER)
+        end
+
+        # Execute actions on robot
+        joint_pos = d.qpos[8:19]
+        joint_vel = d.qvel[7:18]
+        raw_torques = KP .* (U_global[:, 1] .- joint_pos) .- KD .* joint_vel
+        ctrl_torques = zeros(12)
+        ctrl_torques[1:3]   .= raw_torques[4:6]   # FR
+        ctrl_torques[4:6]   .= raw_torques[1:3]   # FL
+        ctrl_torques[7:9]   .= raw_torques[10:12] # RR
+        ctrl_torques[10:12] .= raw_torques[7:9]   # RL
+        d.ctrl .= clamp.(ctrl_torques, -TORQUE_LIMIT, TORQUE_LIMIT)
+
+        U_global[:, 1:end-1] .= U_global[:, 2:end]
+        U_global[:, end] .= HOME_POS
+
+        # Query MPPI expert non-invasively on a state copy (does NOT mutate main simulation d)
+        state_qpos = vec(copy(d.qpos))
+        state_qvel = vec(copy(d.qvel))
+        expert_U = query_mppi_expert(m, state_qpos, state_qvel, U_global)
+
+        collect_dataset!(dataset, hist_vec, expert_U)
+
+        if mod(step_in_round, 20) == 0
+            println("  DAgger R$current_round Step $step_in_round/$DAGGER_STEPS | height = $(round(d.qpos[3], digits=3)) | vel_x = $(round(d.qvel[1], digits=3)) | dataset = $(length(dataset))")
+        end
+
+        qw, qx, qy, qz = d.qpos[4], d.qpos[5], d.qpos[6], d.qpos[7]
+        gravity_z = 1.0 - 2.0 * (qx^2 + qy^2)
+        if d.qpos[3] < 0.22 || gravity_z < 0.64
+            fall_count += 1
+            println("  --- DAgger Fall #$fall_count — resetting ---")
+            reset_robot!(m, d)
+            for t in 1:H; U_global[:, t] .= HOME_POS; end
+        end
+
+        if step_in_round == DAGGER_STEPS
+            println("\n--- DAgger Round $current_round complete. Retraining diffusion policy on aggregated dataset ---")
+            retrain_diffusion_policy!()
+            println("=== DAgger Round $current_round retraining done ===\n")
+
+            if current_round == DAGGER_ROUNDS
+                policy_ready = true
+                println("✓ All DAgger rounds complete! Switching to final pure Diffusion policy control.")
+            end
+        end
+
+        return
+    end
+
+    # ═══════════════════════════════════════════════════════════════════
+    # PHASE 1–2: Initial MPPI Expert Data Collection (500 Iterations)
+    # ═══════════════════════════════════════════════════════════════════
     costs, trajs = mppi_update!(m, d)
 
-    # Store true converged U_global paired with exact state
-    collect_dataset!(dataset, (qpos=state_qpos, qvel=state_qvel), U_global)
+    collect_dataset!(dataset, hist_vec, U_global)
 
     h = d.qpos[3]
     h_diff = h - 0.38
@@ -383,8 +546,9 @@ function visual_controller!(m, d)
     push!(log_n_sat,      n_saturated)
     push!(log_max_torque, maximum(abs.(raw_torques)))
 
-    println("Iter $iter | cost = $(round(minimum(costs), digits=2)) | height = $(round(d.qpos[3], digits=3)) | vel_x = $(round(d.qvel[1], digits=3))")
-    println("    breakdown | height=$(round(h_c,digits=1)) quat=$(round(q_c,digits=1)) jrange=$(round(j_c,digits=1)) sym=$(round(s_c,digits=1)) vel=$(round(v_c,digits=1)) lateral=$(round(la_c,digits=1)) jvel=$(round(jv_c,digits=1))")
+    if mod(iter, 50) == 0
+        println("MPPI Iter $iter / $DATA_ITERS | cost = $(round(minimum(costs), digits=2)) | height = $(round(d.qpos[3], digits=3)) | vel_x = $(round(d.qvel[1], digits=3))")
+    end
 
     # Fall detection
     qw, qx, qy, qz = d.qpos[4], d.qpos[5], d.qpos[6], d.qpos[7]
@@ -392,54 +556,28 @@ function visual_controller!(m, d)
 
     if d.qpos[3] < 0.22 || gravity_z < 0.64
         fall_count += 1
-        println("--- Fall #$fall_count (height=$(round(d.qpos[3],digits=2)), gravity_z=$(round(gravity_z,digits=2))) — resetting position ---")
+        println("--- Fall #$fall_count — resetting position ---")
         reset_robot!(m, d)
     end
 
-    # ── Phase 3: Train + Phase 4: Initialize ────────────────────────
-    if iter == MAX_ITERS
-        println("\n✓ Data collection complete ($(MAX_ITERS) iterations)")
+        # Initial training at the end of initial data collection phase
+        if iter == DATA_ITERS
+            println("\n✓ MPPI data collection complete ($(DATA_ITERS) iterations)")
 
-        open("metrics.csv", "w") do io
-            println(io, "iter,min_cost,height,vel_x,height_cost,quat_cost,joint_cost,sym_cost,vel_cost,lateral_cost,jvel_cost,n_saturated,max_raw_torque")
-            for i in eachindex(log_iter)
-                println(io, "$(log_iter[i]),$(log_min_cost[i]),$(log_height[i]),$(log_vel_x[i]),$(log_height_c[i]),$(log_quat_c[i]),$(log_joint_c[i]),$(log_sym_c[i]),$(log_vel_c[i]),$(log_lateral_c[i]),$(log_jvel_c[i]),$(log_n_sat[i]),$(log_max_torque[i])")
+            open("metrics.csv", "w") do io
+                println(io, "iter,min_cost,height,vel_x,height_cost,quat_cost,joint_cost,sym_cost,vel_cost,lateral_cost,jvel_cost,n_saturated,max_raw_torque")
+                for i in eachindex(log_iter)
+                    println(io, "$(log_iter[i]),$(log_min_cost[i]),$(log_height[i]),$(log_vel_x[i]),$(log_height_c[i]),$(log_quat_c[i]),$(log_joint_c[i]),$(log_sym_c[i]),$(log_vel_c[i]),$(log_lateral_c[i]),$(log_jvel_c[i]),$(log_n_sat[i]),$(log_max_torque[i])")
+                end
             end
+            println("✓ Metrics saved to metrics.csv")
+
+            println("\n=== Initial Diffusion Training on $DATA_ITERS MPPI Iterations ===")
+            retrain_diffusion_policy!()
+            policy_ready = true
+            println("=== Starting DAgger correction rounds for Diffusion Policy ===")
         end
-        println("✓ Metrics saved to metrics.csv")
-
-        # Filter out fallen states (height < 0.28m)
-        filtered_dataset = filter(d -> d[1][3] >= 0.28, dataset)
-        println("✓ Dataset collected: $(length(dataset)) steps. Clean non-fallen samples: $(length(filtered_dataset))")
-
-        Q = hcat([vcat(d[1], d[2]) for d in filtered_dataset]...)
-        U_ds = hcat([d[3] for d in filtered_dataset]...)
-        phase4_μ_q = Float32.(mean(Q, dims=2))
-        phase4_σ_q = Float32.(std(Q,  dims=2) .+ 1e-6)
-        phase4_μ_u = Float32.(mean(U_ds, dims=2))
-        phase4_σ_u = Float32.(std(U_ds,  dims=2) .+ 1e-6)
-        X_state, X_ctrl = prepare_dataset(filtered_dataset, phase4_μ_q, phase4_σ_q, phase4_μ_u, phase4_σ_u)
-
-        # Phase 3: Train Diffusion Model on True MPPI Trajectories
-        train_diffusion!(model, X_state, X_ctrl; epochs=100, batchsize=64, lr=1e-3)
-
-        # Precompute noise schedule for Phase 4
-        β_sched = Float32.(collect(LinRange(1e-4, 0.18, T_diff)))
-        phase4_α = cumprod(1.0f0 .- β_sched)
-
-        # Initial DDIM warm-start
-        println("=== Phase 4: Initializing DDIM Warm-Start ===")
-        current_state = Float32.(vcat(d.qpos, d.qvel))
-        norm_state = (current_state .- phase4_μ_q) ./ phase4_σ_q
-        u_ws = ddim_sample(model, norm_state, phase4_α, T_diff; num_steps=20)
-        μ_u_mat = reshape(phase4_μ_u, nu, H)
-        σ_u_mat = reshape(phase4_σ_u, nu, H)
-        global U_global .= (u_ws .* σ_u_mat) .+ μ_u_mat
-
-        phase4_ready = true
-        println("✓ Phase 4 active: Diffusion warm-start + MPPI refinement running for $PHASE4_ITERS iterations")
     end
-end
 
 init_visualiser()
 visualise!(mj_model, mj_data; controller=visual_controller!)
