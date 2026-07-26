@@ -1,0 +1,182 @@
+================================================================================
+          QUADRUPED CONTROL & IMITATION LEARNING (MPPI + DAGGER + MLP)
+                         STRUCTURED PSEUDOCODE BREAKDOWN
+================================================================================
+
+--------------------------------------------------------------------------------
+1. CONFIGURATION & CONSTANTS
+--------------------------------------------------------------------------------
+NUM_JOINTS         = 12                    # 3 joints per leg x 4 legs
+PLANNING_HORIZON   = 40                    # Lookahead steps (H)
+NUM_MPPI_ROLLOUTS  = 150                   # Parallel trajectory candidates (K)
+STATE_DIM          = 37                    # qpos(19) + qvel(18)
+HISTORY_LEN        = 4                     # Past frames stacked into input
+HISTORY_DIM        = 37 * 4 = 148          # Total input vector size
+TRAJ_DIM           = 12 * 40 = 480         # Total output trajectory vector size
+
+HOME_POS           = [0.0, 0.9, -1.8] x 4  # Default standing pose (FL, FR, RL, RR)
+TORQUE_LIMITS      = [23.7, 23.7, 45.43] x 4 # Joint torque limits
+
+
+--------------------------------------------------------------------------------
+2. COST FUNCTION (EXPERT REWARD EVALUATION)
+--------------------------------------------------------------------------------
+FUNCTION Compute_Cost(robot_state, joint_targets):
+    # Height Penalty (Keep base at 0.38m)
+    height_cost = 30000 * (robot_height - 0.38)^2
+    
+    # Orientation Penalty (Keep body upright, block roll & pitch)
+    quat_cost = 150000 * (1.0 - projected_gravity_z)^2
+    
+    # Heading Penalty (Prevent unwanted yaw rotation)
+    yaw_cost = 50000 * yaw_angle^2
+    
+    # Joint Limit Penalty (Prevent over-extension)
+    joint_cost = SUM(Soft_Limit_Penalty(joint_angles))
+    
+    # Symmetry Penalty (Keep left & right legs symmetric, block 1-leg standing)
+    sym_cost = 5000 * || FL_leg - FR_leg ||^2 + 5000 * || RL_leg - RR_leg ||^2
+    
+    # Stance Regularizer (Keep posture close to HOME_POS standing pose)
+    pose_reg_cost = 2000 * || joint_angles - HOME_POS ||^2
+    
+    # Velocity Penalty (Target forward speed = 0.3 m/s)
+    IF vel_x <= 0.3:
+        vel_cost = 50000 * (vel_x - 0.3)^2       # Forward pull towards 0.3 m/s
+    ELSE:
+        vel_cost = 120000 * (vel_x - 0.3)^2      # Overspeed penalty (prevents tipping forward)
+    
+    RETURN height_cost + quat_cost + yaw_cost + joint_cost + sym_cost + pose_reg_cost + vel_cost
+
+
+--------------------------------------------------------------------------------
+3. MPPI OPTIMIZATION (THE EXPERT CONTROLLER)
+--------------------------------------------------------------------------------
+FUNCTION MPPI_Update(robot_state, current_trajectory_seed):
+    # 1. Sample Gaussian noise for K candidate trajectories across horizon H
+    noise = Sample_Gaussian_Noise(shape=[K, NUM_JOINTS, H])
+    
+    # 2. Parallel Rollout in MuJoCo physics engine
+    FOR k IN 1 TO K IN PARALLEL:
+        Simulate_State = Copy(robot_state)
+        
+        FOR t IN 1 TO H:
+            target_t = current_trajectory_seed[:, t] + noise[k, :, t]
+            
+            # Compute PD torques: Tau = KP * (Target - Pos) - KD * Vel
+            torques = KP * (target_t - joint_pos) - KD * joint_vel
+            Apply_Torques(Simulate_State, Clamp(torques))
+            
+            Step_Physics_Engine(Simulate_State)
+            Accumulate_Cost(k, Compute_Cost(Simulate_State, target_t))
+            
+    # 3. Information-Theoretic Weighted Averaging
+    min_cost = Minimum(costs)
+    weights = Exp(-1 / Temperature * (costs - min_cost))
+    weights = Normalize(weights)
+    
+    # 4. Update optimal global trajectory
+    FOR t IN 1 TO H:
+        optimal_noise = SUM(weights[k] * noise[k, :, t])
+        current_trajectory_seed[:, t] += optimal_noise
+        
+    RETURN current_trajectory_seed
+
+
+--------------------------------------------------------------------------------
+4. NEURAL NETWORK ARCHITECTURE & INFERENCE (MLP)
+--------------------------------------------------------------------------------
+NETWORK MLP_Policy:
+    Layer 1: Dense(148 -> 512, ReLU)  # Takes 4-frame history buffer
+    Layer 2: Dense(512 -> 512, ReLU)
+    Layer 3: Dense(512 -> 512, ReLU)
+    Layer 4: Dense(512 -> 480, Linear) # Outputs 480-dim trajectory vector
+
+FUNCTION Policy_Predict(history_buffer):
+    # 1. Normalize 4-frame input vector
+    norm_input = (history_buffer - mean_q) / std_q
+    
+    # 2. Single forward pass (0-latency neural net prediction)
+    norm_output = MLP_Policy(norm_input)
+    
+    # 3. Unnormalize residual output
+    unnorm_residual = (norm_output * std_u) + mean_u
+    
+    # 4. Add HOME_POS standing baseline (Residual Formulation)
+    final_trajectory = HOME_POS + Reshape(unnorm_residual, [12, 40])
+    
+    RETURN Clamp(final_trajectory, JOINT_LIMITS)
+
+
+--------------------------------------------------------------------------------
+5. COMPLETE CONTROL PIPELINE (DATA COLLECTION -> DAGGER -> EXECUTION)
+--------------------------------------------------------------------------------
+MAIN_CONTROL_LOOP:
+    
+    ========================================================================
+    PHASE 1: EXPERT DATA COLLECTION (Iterations 1 to 500)
+    ========================================================================
+    FOR step = 1 TO 500:
+        # A. Store 4-frame history vector
+        history_vec = Stack_Last_4_Frames(current_robot_state)
+        
+        # B. Run full MPPI optimization (K=150 parallel physics rollouts)
+        optimal_trajectory = MPPI_Update(current_robot_state, U_global)
+        
+        # C. Save (History_Vector, Trajectory_Residual) pair to Dataset
+        Save_Dataset(history_vec, optimal_trajectory - HOME_POS)
+        
+        # D. Step real robot in MuJoCo
+        Apply_PD_Control(optimal_trajectory[:, 1])
+        Step_Physics()
+        
+    # Initial Training on Expert Data
+    Filter_Fallen_States(Dataset)  # Keep states where height >= 0.28m
+    Train_MLP_Policy(Dataset, Epochs=120, BatchSize=32)
+    
+    
+    ========================================================================
+    PHASE 2: DAGGER CORRECTION ROUNDS (Rounds 1 to 2, 200 steps each)
+    ========================================================================
+    FOR round = 1 TO 2:
+        FOR step = 1 TO 200:
+            history_vec = Stack_Last_4_Frames(current_robot_state)
+            
+            # Step A: MLP Policy Acts (Learner takes action in environment)
+            mlp_trajectory = Policy_Predict(history_vec)
+            Apply_PD_Control(mlp_trajectory[:, 1])
+            Step_Physics()
+            
+            # Step B: Query MPPI Expert ("What would expert do from this MLP-visited state?")
+            # Seed MPPI with 70% active trajectory + 30% HOME_POS prior
+            expert_seed = 0.7 * mlp_trajectory + 0.3 * HOME_POS
+            
+            # Run 3 MPPI passes to get expert recovery label
+            expert_label = MPPI_Update(current_robot_state, expert_seed, iterations=3)
+            
+            # Step C: Aggregate (MLP State, Expert Correction Label) into Dataset
+            Save_Dataset(history_vec, expert_label - HOME_POS)
+            
+        # Retrain Policy on Aggregated Dataset
+        Filter_Fallen_States(Dataset)
+        Train_MLP_Policy(Dataset, Epochs=120, BatchSize=32)
+        
+        
+    ========================================================================
+    PHASE 3: PURE MLP EXECUTION WITH RECEDING HORIZON (500 steps, NO MPPI)
+    ========================================================================
+    FOR step = 1 TO 500:
+        history_vec = Stack_Last_4_Frames(current_robot_state)
+        
+        # Re-predict trajectory every 4 steps (Receding Horizon)
+        IF step % 4 == 1:
+            active_trajectory = Policy_Predict(history_vec)
+            
+        # Apply 1st step of predicted trajectory via PD control (Fast 0-latency pass)
+        Apply_PD_Control(active_trajectory[:, 1])
+        Step_Physics()
+        
+        # Shift trajectory horizon forward 1 step
+        active_trajectory[:, 1:end-1] = active_trajectory[:, 2:end]
+        active_trajectory[:, end] = HOME_POS
+================================================================================
